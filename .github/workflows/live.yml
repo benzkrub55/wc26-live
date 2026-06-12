@@ -1,0 +1,35 @@
+name: WC2026 Live Goals
+
+on:
+  schedule:
+    # ทุก 5 นาที ช่วง UTC 16:00-06:55 = ไทย 23:00-13:55 (ช่วงมีบอลเตะ)
+    - cron: "*/5 0-6,16-23 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Report live goals
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+        run: python live.py
+      - name: Commit state
+        run: |
+          if [ -f live_state.json ] && [ -n "$(git status --porcelain live_state.json)" ]; then
+            git config user.name "wc26-live"
+            git config user.email "actions@github.com"
+            git add live_state.json
+            git commit -m "Update live state"
+            git pull --rebase origin main
+            git push
+          fi
