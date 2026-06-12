@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-"""WC2026 live goal reporter (runs every ~5 min during match hours).
+"""WC2026 live goal reporter — long-poll mode.
 
-Polls football-data.org for in-play matches and announces:
-  * kickoff (first time a match is seen in play)
-  * every score change (goal), with which side scored
-  * half-time
-Full-time announcements are handled by wc26-bot/results.py, not here.
-State lives in live_state.json (committed by the workflow).
+The workflow starts this script every 30 min (match hours); the script then
+loops internally, polling football-data.org every ~60s for up to LOOP_MINUTES,
+announcing kickoff / goals / half-time to Telegram as they happen.
+State (live_state.json) is committed after every change to prevent duplicates.
+Exits early when no match is live and none kicks off soon.
 """
 import json
 import os
+import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 FD_TOKEN = os.environ["FOOTBALL_DATA_TOKEN"]
+LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "28"))
+POLL_SECONDS = 60
 THAI_TZ = timezone(timedelta(hours=7))
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(BASE, "live_state.json")
@@ -53,7 +56,7 @@ def send(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode()
     with urllib.request.urlopen(url, data=data, timeout=30) as resp:
-        print("telegram:", resp.read().decode()[:100])
+        print("telegram:", resp.read().decode()[:100], flush=True)
 
 
 def fetch_matches():
@@ -68,9 +71,24 @@ def fetch_matches():
         return json.loads(resp.read()).get("matches", [])
 
 
-def main():
-    state = json.load(open(STATE)) if os.path.exists(STATE) else {}
+def commit_state():
+    try:
+        subprocess.run(["git", "add", STATE], cwd=BASE, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=wc26-live", "-c", "user.email=actions@github.com",
+             "commit", "-m", "Update live state"], cwd=BASE, check=True)
+        subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=BASE, check=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=BASE, check=True)
+    except subprocess.CalledProcessError as e:
+        print("git error (non-fatal):", e, flush=True)
+
+
+def process_once(state):
+    """Return (changed, any_live, minutes_to_next_kickoff)."""
     changed = False
+    any_live = False
+    next_ko = None
+    now_utc = datetime.utcnow()
 
     for m in fetch_matches():
         mid = str(m["id"])
@@ -80,7 +98,13 @@ def main():
         h = ft.get("home") or 0
         a = ft.get("away") or 0
 
-        if status in ("IN_PLAY", "PAUSED"):
+        if status in ("TIMED", "SCHEDULED"):
+            ko = datetime.strptime(m["utcDate"], "%Y-%m-%dT%H:%M:%SZ")
+            mins = (ko - now_utc).total_seconds() / 60
+            if mins > -5 and (next_ko is None or mins < next_ko):
+                next_ko = mins
+        elif status in ("IN_PLAY", "PAUSED"):
+            any_live = True
             prev = state.get(mid)
             if prev is None:
                 send(f"🔛 เกมเริ่มแล้ว! {home} พบ {away}")
@@ -95,16 +119,35 @@ def main():
             if status == "PAUSED" and prev.get("status") != "PAUSED":
                 send(f"⏸️ หมดครึ่งแรก: {home} {h} - {a} {away}")
                 changed = True
+            if status == "IN_PLAY" and prev.get("status") == "PAUSED":
+                send(f"▶️ เริ่มครึ่งหลัง: {home} {h} - {a} {away}")
+                changed = True
             if prev.get("status") != status:
                 prev["status"] = status
                 changed = True
         elif status == "FINISHED" and mid in state:
-            del state[mid]  # FT ประกาศโดย wc26-bot อยู่แล้ว
+            del state[mid]  # FT ประกาศโดย wc26-bot
             changed = True
 
-    if changed:
-        json.dump(state, open(STATE, "w"))
-    print(f"state changed: {changed}, tracking {len(state)} match(es)")
+    return changed, any_live, next_ko
+
+
+def main():
+    state = json.load(open(STATE)) if os.path.exists(STATE) else {}
+    deadline = time.time() + LOOP_MINUTES * 60
+    while time.time() < deadline:
+        try:
+            changed, any_live, next_ko = process_once(state)
+            if changed:
+                json.dump(state, open(STATE, "w"))
+                commit_state()
+            if not any_live and (next_ko is None or next_ko > 40):
+                print("no live match and none starting soon -> exit", flush=True)
+                break
+        except Exception as e:
+            print("poll error (will retry):", e, flush=True)
+        time.sleep(POLL_SECONDS)
+    print("loop done", flush=True)
 
 
 if __name__ == "__main__":
